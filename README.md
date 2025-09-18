@@ -125,6 +125,8 @@ python build_windows_installer.py
 
 The generated installer lives in `build/nsis/`. Running it installs the application, adds a Start Menu launcher called **Civitai Model Downloader**, and exposes a `downloader` command for the CLI utilities from any terminal.
 
+=======
+
 **Helper script** `fetch_all_models.py`
 ```
 python fetch_all_models.py --username <USERNAME> --token <API_TOKEN>
