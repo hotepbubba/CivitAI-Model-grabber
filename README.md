@@ -114,6 +114,19 @@ python build_gui_executable.py
 
 You can pass custom PyInstaller arguments to `build_executable` by editing the call in `build_gui_executable.py` if you need to tailor the build for different platforms or distribution requirements.
 
+### Building the Windows installer
+
+To produce a Windows installer (``CivitaiModelDownloaderInstaller.exe``) that bundles Python and creates Start Menu shortcuts, install the requirements and ensure NSIS is available on your PATH (the default Windows installer from [nsis.sourceforge.net](https://nsis.sourceforge.net/Download) works).
+
+```bash
+pip install -r requirements.txt
+python build_windows_installer.py
+```
+
+The generated installer lives in `build/nsis/`. Running it installs the application, adds a Start Menu launcher called **Civitai Model Downloader**, and exposes a `downloader` command for the CLI utilities from any terminal.
+
+=======
+
 **Helper script** `fetch_all_models.py`
 ```
 python fetch_all_models.py --username <USERNAME> --token <API_TOKEN>
