@@ -95,6 +95,25 @@ default=None
 + "Provide a Token and it can also Download those Models behind the CivitAI Login."
 + If you forgot to Provide a Token the Script asks for your token.
 
+## Graphical User Interface
+
+The repository also includes a desktop GUI that exposes the same options as the command-line tools.
+
+```bash
+python gui_app.py
+```
+
+### Building a standalone executable
+
+Install the project requirements and run the helper script below to produce a self-contained executable (``.exe`` on Windows) using PyInstaller. The resulting artifact will be created inside the `dist/` directory.
+
+```bash
+pip install -r requirements.txt
+python build_gui_executable.py
+```
+
+You can pass custom PyInstaller arguments to `build_executable` by editing the call in `build_gui_executable.py` if you need to tailor the build for different platforms or distribution requirements.
+
 **Helper script** `fetch_all_models.py`
 ```
 python fetch_all_models.py --username <USERNAME> --token <API_TOKEN>

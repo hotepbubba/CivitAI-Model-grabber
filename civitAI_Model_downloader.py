@@ -4,8 +4,9 @@ import requests
 import logging
 import urllib.parse
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, List, Optional
 from tqdm import tqdm
 import time
 import argparse
@@ -28,54 +29,82 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler_md.setFormatter(formatter)
 logger_md.addHandler(file_handler_md)
 
-# Argument parsing
-parser = argparse.ArgumentParser(description="Download model files and images from Civitai API.")
-parser.add_argument("usernames", nargs='+', type=str, help="Enter one or more usernames you want to download from.")
-parser.add_argument("--retry_delay", type=int, default=10, help="Retry delay in seconds.")
-parser.add_argument("--max_tries", type=int, default=3, help="Maximum number of retries.")
-parser.add_argument("--max_threads", type=int, default=5, help="Maximum number of concurrent threads. Too many produces API Failure.")
-parser.add_argument("--token", type=str, default=None, help="API Token for Civitai.")
-parser.add_argument("--download_type", type=str, default=None, help="Specify the type of content to download: 'Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other', or 'All' (default).")
-args = parser.parse_args()
-
-# Prompt the user for the token if it's not provided via command line
-if args.token is None:
-    args.token = input("Please enter your Civitai API token: ")
-
-# Initialize variables
-usernames = args.usernames
-retry_delay = args.retry_delay
-max_tries = args.max_tries
-max_threads = args.max_threads
-token = args.token
-
 # Function to sanitize directory names
 def sanitize_directory_name(name):
     return name.rstrip()  # Remove trailing whitespace characters
 
-# Create output directory
-OUTPUT_DIR = sanitize_directory_name(OUTPUT_DIR)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Create session
-session = requests.Session()
+def build_argument_parser():
+    parser = argparse.ArgumentParser(description="Download model files and images from Civitai API.")
+    parser.add_argument("usernames", nargs='+', type=str, help="Enter one or more usernames you want to download from.")
+    parser.add_argument("--retry_delay", type=int, default=10, help="Retry delay in seconds.")
+    parser.add_argument("--max_tries", type=int, default=3, help="Maximum number of retries.")
+    parser.add_argument("--max_threads", type=int, default=5, help="Maximum number of concurrent threads. Too many produces API Failure.")
+    parser.add_argument("--token", type=str, default=None, help="API Token for Civitai.")
+    parser.add_argument("--download_type", type=str, default=None, help="Specify the type of content to download: 'Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other', or 'All' (default).")
+    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Directory where downloaded models should be stored.")
+    return parser
 
-# Validate download type
-if args.download_type:
-    download_type = args.download_type
+
+def validate_download_type(download_type: Optional[str]) -> str:
+    if download_type is None:
+        return 'All'
     if download_type not in VALID_DOWNLOAD_TYPES:
-        print("Error: Invalid download type specified.")
-        print("Valid download types are: 'Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other', or 'All'.")
-        sys.exit(1)
-else:
-    while True:
-        download_type = input("Please enter the type of content to download (Lora, Checkpoints, Embeddings, 'Training_Data', Other, or All): ")
-        if download_type in VALID_DOWNLOAD_TYPES:
-            break
-        else:
-            print("Invalid download type. Please try again.")
+        raise ValueError(
+            "Invalid download type specified. Valid types are: 'Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other', or 'All'."
+        )
+    return download_type
 
-def read_summary_data(username):
+
+def _clean_username(username: str) -> Optional[str]:
+    username = username.strip()
+    return username or None
+
+
+@dataclass
+class DownloaderConfig:
+    usernames: List[str] = field(default_factory=list)
+    retry_delay: int = 10
+    max_tries: int = 3
+    max_threads: int = 5
+    token: Optional[str] = None
+    download_type: str = 'All'
+    output_dir: str = field(default=OUTPUT_DIR)
+
+    def __post_init__(self):
+        cleaned_usernames = [_clean_username(user) for user in self.usernames]
+        self.usernames = [user for user in cleaned_usernames if user]
+        if not self.usernames:
+            raise ValueError("At least one username must be provided.")
+
+        self.download_type = validate_download_type(self.download_type)
+        self.output_dir = sanitize_directory_name(self.output_dir)
+
+
+def create_config_from_args(args: argparse.Namespace) -> DownloaderConfig:
+    return DownloaderConfig(
+        usernames=args.usernames,
+        retry_delay=args.retry_delay,
+        max_tries=args.max_tries,
+        max_threads=args.max_threads,
+        token=args.token,
+        download_type=args.download_type,
+        output_dir=args.output_dir,
+    )
+
+
+def ensure_output_directory(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def emit(message: str, log_callback: Optional[Callable[[str], None]] = None, level: int = logging.INFO) -> None:
+    logger_md.log(level, message)
+    if log_callback:
+        log_callback(message)
+    else:
+        print(message)
+
+def read_summary_data(username: str, log_callback: Optional[Callable[[str], None]] = None):
     """Read summary data from a file."""
     summary_path = os.path.join(SCRIPT_DIR, f"{username}.txt")
     data = {}
@@ -89,7 +118,7 @@ def read_summary_data(username):
                     category, count = line.strip().split(' - Count:')
                     data[category.strip()] = int(count.strip())
     except FileNotFoundError:
-        print(f"File {summary_path} not found.")
+        emit(f"File {summary_path} not found.", log_callback, level=logging.WARNING)
     return data
 
 def sanitize_name(name, folder_name=None, max_length=MAX_PATH_LENGTH, subfolder=None, output_dir=None, username=None):
@@ -123,22 +152,35 @@ def sanitize_name(name, folder_name=None, max_length=MAX_PATH_LENGTH, subfolder=
     return sanitized_name.strip()
 
 
-def download_file_or_image(url, output_path, retry_count=0, max_retries=max_tries):
+def download_file_or_image(
+    url: str,
+    output_path: str,
+    session: requests.Session,
+    config: DownloaderConfig,
+    username: str,
+    retry_count: int = 0,
+    log_callback: Optional[Callable[[str], None]] = None,
+):
     """Download a file or image from the provided URL."""
-    # Check if the file already exists
     if os.path.exists(output_path):
         return False
-    
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     progress_bar = None
     try:
         response = session.get(url, stream=True, timeout=(20, 40))
         if response.status_code == 404:
-            print(f"File not found: {url}")
+            emit(f"File not found: {url}", log_callback, level=logging.WARNING)
             return False
         response.raise_for_status()
         total_size = int(response.headers.get('content-length', 0))
-        progress_bar = tqdm(total=total_size, unit='B', unit_scale=True, leave=False)
+        progress_bar = tqdm(
+            total=total_size,
+            unit='B',
+            unit_scale=True,
+            leave=False,
+            disable=log_callback is not None,
+        )
         with open(output_path, "wb") as file:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
@@ -146,41 +188,86 @@ def download_file_or_image(url, output_path, retry_count=0, max_retries=max_trie
                     file.write(chunk)
         progress_bar.close()
         if output_path.endswith('.safetensor') and os.path.getsize(output_path) < 4 * 1024 * 1024:  # 4MB
-            if retry_count < max_retries:
-                print(f"File {output_path} is smaller than expected. Try to download again (attempt {retry_count}).")
-                time.sleep(retry_delay)
-                return download_file_or_image(url, output_path, retry_count + 1, max_retries)
-            else:
-                download_errors_log = os.path.join(SCRIPT_DIR, f'{username}.download_errors.log')
-                with open(download_errors_log, 'a', encoding='utf-8') as log_file:
-                    log_file.write(f"Failed to download {url} after {max_retries} attempts.\n")
-                return False
-        return True
-    except (requests.RequestException, Exception)as e:
-        if retry_count < max_retries:
-            print(f"Error downloading {url}: {e}. Retrying in {retry_delay} seconds (attempt {retry_count}).")
-            time.sleep(retry_delay)
-            return download_file_or_image(url, output_path, retry_count + 1, max_retries)
-        else:
+            if retry_count < config.max_tries:
+                emit(
+                    f"File {output_path} is smaller than expected. Try to download again (attempt {retry_count + 1}).",
+                    log_callback,
+                    level=logging.WARNING,
+                )
+                time.sleep(config.retry_delay)
+                return download_file_or_image(
+                    url,
+                    output_path,
+                    session,
+                    config,
+                    username,
+                    retry_count + 1,
+                    log_callback,
+                )
             download_errors_log = os.path.join(SCRIPT_DIR, f'{username}.download_errors.log')
             with open(download_errors_log, 'a', encoding='utf-8') as log_file:
-                log_file.write(f"Failed to download {url} after {max_retries} attempts. Error: {e}\n")
+                log_file.write(f"Failed to download {url} after {config.max_tries} attempts.\n")
             return False
+        return True
     except (requests.RequestException, TimeoutError, ConnectionResetError) as e:
         if progress_bar:
             progress_bar.close()
-        if retry_count < max_retries:
-            print(f"Error during download: {url}, attempt {retry_count + 1}")
-            time.sleep(retry_delay)
-            return download_file_or_image(url, output_path, retry_count + 1, max_retries)
-        else:
-            download_errors_log = os.path.join(SCRIPT_DIR, f'{username}.download_errors.log')
-            with open(download_errors_log, 'a', encoding='utf-8') as log_file:
-                log_file.write(f"Error downloading file {output_path} from URL {url}: {e} after {max_retries} attempts\n")
-            return False
+        if retry_count < config.max_tries:
+            emit(
+                f"Error downloading {url}: {e}. Retrying in {config.retry_delay} seconds (attempt {retry_count + 1}).",
+                log_callback,
+                level=logging.WARNING,
+            )
+            time.sleep(config.retry_delay)
+            return download_file_or_image(
+                url,
+                output_path,
+                session,
+                config,
+                username,
+                retry_count + 1,
+                log_callback,
+            )
+        download_errors_log = os.path.join(SCRIPT_DIR, f'{username}.download_errors.log')
+        with open(download_errors_log, 'a', encoding='utf-8') as log_file:
+            log_file.write(f"Failed to download {url} after {config.max_tries} attempts. Error: {e}\n")
+        return False
+    except Exception as e:  # pylint: disable=broad-except
+        if progress_bar:
+            progress_bar.close()
+        if retry_count < config.max_tries:
+            emit(
+                f"Error during download: {url}, attempt {retry_count + 1}",
+                log_callback,
+                level=logging.WARNING,
+            )
+            time.sleep(config.retry_delay)
+            return download_file_or_image(
+                url,
+                output_path,
+                session,
+                config,
+                username,
+                retry_count + 1,
+                log_callback,
+            )
+        download_errors_log = os.path.join(SCRIPT_DIR, f'{username}.download_errors.log')
+        with open(download_errors_log, 'a', encoding='utf-8') as log_file:
+            log_file.write(f"Error downloading file {output_path} from URL {url}: {e} after {config.max_tries} attempts\n")
+        return False
     return True
 
-def download_model_files(item_name, model_version, item, download_type, failed_downloads_file):
+def download_model_files(
+    item_name: str,
+    model_version: dict,
+    item: dict,
+    download_type: str,
+    failed_downloads_file: str,
+    session: requests.Session,
+    config: DownloaderConfig,
+    username: str,
+    log_callback: Optional[Callable[[str], None]] = None,
+):
     """Download related image and model files for each model version."""
     files = model_version.get('files', [])
     images = model_version.get('images', [])
@@ -197,6 +284,7 @@ def download_model_files(item_name, model_version, item, download_type, failed_d
     trigger_words =  model_version.get('trainedWords', [])
     
 
+    subfolder = 'Other'
     for file in files:
         file_name = file.get('name', '')
         file_url = file.get('downloadUrl', '')
@@ -234,10 +322,10 @@ def download_model_files(item_name, model_version, item, download_type, failed_d
 
         # Create folder structure
         if base_model:
-            item_dir = os.path.join(OUTPUT_DIR, username, subfolder, base_model, item_name_sanitized)
+            item_dir = os.path.join(config.output_dir, username, subfolder, base_model, item_name_sanitized)
             logging.info(f"Using baseModel folder structure for {item_name}: {base_model}")
         else:
-            item_dir = os.path.join(OUTPUT_DIR, username, subfolder, item_name_sanitized)
+            item_dir = os.path.join(config.output_dir, username, subfolder, item_name_sanitized)
             logging.info(f"No baseModel found for {item_name}, using standard folder structure")
 
         try:
@@ -261,19 +349,32 @@ def download_model_files(item_name, model_version, item, download_type, failed_d
             for word in trigger_words:
                 f.write(f"{word}\n")
 
-        if '?' in file_url:
-            file_url += f"&token={token}&nsfw=true"
+        if config.token:
+            if '?' in file_url:
+                file_url += f"&token={config.token}&nsfw=true"
+            else:
+                file_url += f"?token={config.token}&nsfw=true"
         else:
-            file_url += f"?token={token}&nsfw=true"
+            if '?' in file_url:
+                file_url += "&nsfw=true"
+            else:
+                file_url += "?nsfw=true"
 
-        file_name_sanitized = sanitize_name(file_name, item_name, max_length=MAX_PATH_LENGTH, subfolder=subfolder)
+        file_name_sanitized = sanitize_name(
+            file_name,
+            item_name,
+            max_length=MAX_PATH_LENGTH,
+            subfolder=subfolder,
+            output_dir=config.output_dir,
+            username=username,
+        )
         file_path = os.path.join(item_dir, file_name_sanitized)
 
         if not file_name or not file_url:
-            print(f"Invalid file entry: {file}")
+            emit(f"Invalid file entry: {file}", log_callback, level=logging.WARNING)
             continue
 
-        success = download_file_or_image(file_url, file_path)
+        success = download_file_or_image(file_url, file_path, session, config, username, log_callback=log_callback)
         if success:
             downloaded = True
         else:
@@ -293,14 +394,22 @@ def download_model_files(item_name, model_version, item, download_type, failed_d
             image_id = image.get('id', '')
             image_url = image.get('url', '')
 
-            image_filename_raw = f"{item_name}_{image_id}_for_{file_name}.jpeg"
-            image_filename_sanitized = sanitize_name(image_filename_raw, item_name, max_length=MAX_PATH_LENGTH, subfolder=subfolder)
+            reference_file = file_name if files else "model"
+            image_filename_raw = f"{item_name}_{image_id}_for_{reference_file}.jpeg"
+            image_filename_sanitized = sanitize_name(
+                image_filename_raw,
+                item_name,
+                max_length=MAX_PATH_LENGTH,
+                subfolder=subfolder,
+                output_dir=config.output_dir,
+                username=username,
+            )
             image_path = os.path.join(item_dir, image_filename_sanitized)
             if not image_id or not image_url:
-                print(f"Invalid image entry: {image}")
+                emit(f"Invalid image entry: {image}", log_callback, level=logging.WARNING)
                 continue
 
-            success = download_file_or_image(image_url, image_path)
+            success = download_file_or_image(image_url, image_path, session, config, username, log_callback=log_callback)
             if success:
                 downloaded = True
             else:
@@ -316,25 +425,32 @@ def download_model_files(item_name, model_version, item, download_type, failed_d
 
     return item_name, downloaded, model_images
 
-def process_username(username, download_type):
+def process_username(
+    username: str,
+    config: DownloaderConfig,
+    session: requests.Session,
+    log_callback: Optional[Callable[[str], None]] = None,
+):
     """Process a username and download the specified type of content."""
-    print(f"Processing username: {username}, Download type: {download_type}")
-    fetch_user_data = fetch_all_models(token, username)
-    summary_data = read_summary_data(username)
+    emit(f"Processing username: {username}, Download type: {config.download_type}", log_callback)
+    fetch_all_models(config.token, username)
+    summary_data = read_summary_data(username, log_callback)
     total_items = summary_data.get('Total', 0)
 
-    if download_type == 'All':
+    if config.download_type == 'All':
         selected_type_count = total_items
         intentionally_skipped = 0
     else:
-        selected_type_count = summary_data.get(download_type, 0)
+        selected_type_count = summary_data.get(config.download_type, 0)
         intentionally_skipped = total_items - selected_type_count
 
     params = {
         "username": username,
-        "token": token
     }
-    url = f"{BASE_URL}?{urllib.parse.urlencode(params)}&nsfw=true"
+    if config.token:
+        params["token"] = config.token
+    params["nsfw"] = "true"
+    url = f"{BASE_URL}?{urllib.parse.urlencode(params)}"
 
     headers = {
         "Content-Type": "application/json"
@@ -350,12 +466,12 @@ def process_username(username, download_type):
 
     while True:
         if next_page is None:
-            print("End of pagination reached: 'next_page' is None.")
+            emit("End of pagination reached: 'next_page' is None.", log_callback)
             break
 
         retry_count = 0
-        max_retries = max_tries
-        retry_delay = args.retry_delay
+        max_retries = config.max_tries
+        retry_delay = config.retry_delay
 
         while retry_count < max_retries:
             try:
@@ -364,27 +480,33 @@ def process_username(username, download_type):
                 data = response.json()
                 break  # Exit retry loop on successful response
             except (requests.RequestException, TimeoutError, json.JSONDecodeError) as e:
-                print(f"Error making API request or decoding JSON response: {e}")
+                emit(f"Error making API request or decoding JSON response: {e}", log_callback, level=logging.WARNING)
                 retry_count += 1
                 if retry_count < max_retries:
-                    print(f"Retrying in {retry_delay} seconds...")
+                    emit(f"Retrying in {retry_delay} seconds...", log_callback, level=logging.INFO)
                     time.sleep(retry_delay)
                 else:
-                    print("Maximum retries exceeded. Exiting.")
-                    exit()
+                    emit("Maximum retries exceeded. Exiting.", log_callback, level=logging.ERROR)
+                    return {
+                        "username": username,
+                        "downloaded": 0,
+                        "failed": selected_type_count,
+                        "skipped": intentionally_skipped,
+                        "total": total_items,
+                    }
 
         items = data['items']
         metadata = data.get('metadata', {})
         next_page = metadata.get('nextPage')
 
         if not metadata and not items:
-            print("Termination condition met: 'metadata' is empty.")
+            emit("Termination condition met: 'metadata' is empty.", log_callback)
             break
 
         if first_next_page is None:
             first_next_page = next_page
 
-        executor = ThreadPoolExecutor(max_workers=max_threads)
+        executor = ThreadPoolExecutor(max_workers=config.max_threads)
         download_futures = []
         downloaded_item_names = set()
 
@@ -400,26 +522,85 @@ def process_username(username, download_type):
                 item_with_base_model = item.copy()
                 item_with_base_model['baseModel'] = version.get('baseModel')
                 
-                future = executor.submit(download_model_files, item_name, version, item_with_base_model, download_type, failed_downloads_file)
+                future = executor.submit(
+                    download_model_files,
+                    item_name,
+                    version,
+                    item_with_base_model,
+                    config.download_type,
+                    failed_downloads_file,
+                    session,
+                    config,
+                    username,
+                    log_callback,
+                )
                 download_futures.append(future)
 
-        for future in tqdm(download_futures, desc="Downloading Files", unit="file", leave=False):
+        for future in tqdm(
+            download_futures,
+            desc="Downloading Files",
+            unit="file",
+            leave=False,
+            disable=log_callback is not None,
+        ):
             future.result()
 
         executor.shutdown()
-    
-    if download_type == 'All':
-        downloaded_count = sum(len(os.listdir(os.path.join(OUTPUT_DIR, username, category))) for category in ['Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other'] if os.path.exists(os.path.join(OUTPUT_DIR, username, category)))
+
+    user_output_dir = os.path.join(config.output_dir, username)
+    if config.download_type == 'All':
+        downloaded_count = sum(
+            len(os.listdir(os.path.join(user_output_dir, category)))
+            for category in ['Lora', 'Checkpoints', 'Embeddings', 'Training_Data', 'Other']
+            if os.path.exists(os.path.join(user_output_dir, category))
+        )
     else:
-        downloaded_count = len(os.listdir(os.path.join(OUTPUT_DIR, username, download_type))) if os.path.exists(os.path.join(OUTPUT_DIR, username, download_type)) else 0
+        download_dir = os.path.join(user_output_dir, config.download_type)
+        downloaded_count = len(os.listdir(download_dir)) if os.path.exists(download_dir) else 0
 
     failed_count = selected_type_count - downloaded_count
 
-    print(f"Total items for username {username}: {total_items}")
-    print(f"Downloaded items for username {username}: {downloaded_count}")
-    print(f"Intentionally skipped items for username {username}: {intentionally_skipped}")
-    print(f"Failed items for username {username}: {failed_count}")
+    emit(f"Total items for username {username}: {total_items}", log_callback)
+    emit(f"Downloaded items for username {username}: {downloaded_count}", log_callback)
+    emit(f"Intentionally skipped items for username {username}: {intentionally_skipped}", log_callback)
+    emit(f"Failed items for username {username}: {failed_count}", log_callback)
+
+    return {
+        "username": username,
+        "downloaded": downloaded_count,
+        "failed": failed_count,
+        "skipped": intentionally_skipped,
+        "total": total_items,
+    }
+
+
+def run_downloader(
+    config: DownloaderConfig,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> List[dict]:
+    """Execute downloads for all usernames defined in the configuration."""
+    ensure_output_directory(config.output_dir)
+    results = []
+    session = requests.Session()
+    for username in config.usernames:
+        result = process_username(username, config, session, log_callback)
+        results.append(result)
+    return results
+
+
+def prompt_for_token_if_missing(token: Optional[str]) -> Optional[str]:
+    if token:
+        return token
+    return input("Please enter your Civitai API token: ").strip() or None
+
+
+def main(argv: Optional[Iterable[str]] = None):
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    args.token = prompt_for_token_if_missing(args.token)
+    config = create_config_from_args(args)
+    run_downloader(config)
+
 
 if __name__ == "__main__":
-    for username in usernames:
-        process_username(username, download_type)
+    main()
